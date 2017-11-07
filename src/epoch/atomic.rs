@@ -187,23 +187,19 @@ pub struct MarkableAtomic<T> {
     _marker: PhantomData<T>,
 }
 
-fn marked_to_raw<T>(a: usize) -> *mut T {
-    (a & ~0x01) as *mut T
+fn marked_to_raw<T>(a: usize) -> (*mut T, bool) {
+    ((a & !0x01) as *mut T, (a & 0x01) != 0)
 }
 
-fn raw_to_marked<T>(p: *mut T, marked: bool) -> usize {
-    usize_to_marked(p as usize, marked)
+fn raw_to_marked<T>(p: *mut T, mark: bool) -> usize {
+    usize_to_marked(p as usize, mark)
 }
 
-fn usize_is_marked(a: usize) -> bool {
-    (a & 0x01) != 0
-}
-
-fn usize_to_marked(a: usize, marked: bool) -> usize {
-    if marked {
+fn usize_to_marked(a: usize, mark: bool) -> usize {
+    if mark {
         a | 0x01
     } else {
-        a
+        a & !0x01
     }
 }
 
@@ -227,45 +223,53 @@ impl<T> MarkableAtomic<T> {
         }
     }
 
-    pub fn new(data: T) -> Self {
+    pub fn new(data: T, mark: bool) -> Self {
         let p = Box::into_raw(Box::new(data));
         Self {
-            addr: atomic::AtomicUsize::new(raw_to_marked(p, false)),
+            addr: atomic::AtomicUsize::new(raw_to_marked(p, mark)),
             _marker: PhantomData
         }
     }
 
-    pub fn load<'a>(&self, ord: Ordering, _: &'a Guard) -> Option<Shared<'a, T>> {
-        let p = marked_to_raw(self.addr.load(ord));
-        unsafe { Shared::from_raw(p); }
+    pub fn load<'a>(&self, ord: Ordering, _: &'a Guard) 
+                    -> (Option<Shared<'a, T>>, bool)
+    {
+        let (p, mark) = marked_to_raw(self.addr.load(ord));
+        unsafe { (Shared::from_raw(p), mark) }
     }
 
-    pub fn store(&self, val: Option<Owned<T>>, ord: Ordering) {
-        let a = raw_to_marked(opt_owned_into_raw(val), false);
+    pub fn load_mark(&self, ord: Ordering) -> bool {
+        let (_, mark): (*mut T, bool) = marked_to_raw(self.addr.load(ord));
+        mark
+    }
+
+    pub fn store(&self, val: Option<Owned<T>>, mark: bool, ord: Ordering) {
+        let a = raw_to_marked(opt_owned_into_raw(val), mark);
         self.addr.store(a, ord);
     }
 
-    pub fn store_and_ref<'a>(&self, val: Owned<T>, ord: Ordering, _: &'a Guard)
+    pub fn store_and_ref<'a>(&self, val: Owned<T>, mark: bool, 
+                             ord: Ordering, _: &'a Guard)
                              -> Shared<'a, T>
     {
         unsafe {
             let shared = Shared::from_owned(val);
-            self.store_shared(Some(shared), ord);
+            self.store_shared(Some(shared), mark, ord);
             shared
         }
     }
 
-    pub fn store_shared(&self, val: Option<Shared<T>>, ord: Ordering) {
-        let a = raw_to_marked(opt_shared_into_raw(val), false);
+    pub fn store_shared(&self, val: Option<Shared<T>>, mark: bool, ord: Ordering) {
+        let a = raw_to_marked(opt_shared_into_raw(val), mark);
         self.addr.store(a, ord);
     }
 
     pub fn cas(&self, old: Option<Shared<T>>, new: Option<Owned<T>>, 
-               old_marked: bool, new_marked: bool, ord: Ordering)
+               old_mark: bool, new_mark: bool, ord: Ordering)
                -> Result<(), Option<Owned<T>>>
     {
-        let old_a = raw_to_marked(opt_shared_into_raw(old), old_marked);
-        let new_a = raw_to_marked(opt_owned_into_raw(&new), new_marked);
+        let old_a = raw_to_marked(opt_shared_into_raw(old), old_mark);
+        let new_a = raw_to_marked(opt_owned_as_raw(&new), new_mark);
         if self.addr.compare_and_swap(old_a, new_a, ord) == old_a
         {
             mem::forget(new);
@@ -276,12 +280,12 @@ impl<T> MarkableAtomic<T> {
     }
 
     pub fn cas_and_ref<'a>(&self, old: Option<Shared<T>>, new: Owned<T>,
-                           old_marked: bool, new_marked: bool,
+                           old_mark: bool, new_mark: bool,
                            ord: Ordering, _: &'a Guard)
                            -> Result<Shared<'a, T>, Owned<T>>
     {
-        let old_a = raw_to_marked(opt_shared_into_raw(old), old_marked);
-        let new_a = raw_to_marked(new.as_raw(), new_marked);
+        let old_a = raw_to_marked(opt_shared_into_raw(old), old_mark);
+        let new_a = raw_to_marked(new.as_raw(), new_mark);
         if self.addr.compare_and_swap(old_a, new_a, ord) == old_a
         {
             Ok(unsafe { Shared::from_owned(new) })
@@ -291,43 +295,40 @@ impl<T> MarkableAtomic<T> {
     }
 
     pub fn cas_shared(&self, old: Option<Shared<T>>, new: Option<Shared<T>>, 
-                      old_marked: bool, new_marked: bool, ord: Ordering)
+                      old_mark: bool, new_mark: bool, ord: Ordering)
                       -> bool
     {
-        let old_a = raw_to_marked(opt_shared_into_raw(old), old_marked);
-        let new_a = raw_to_marked(opt_shared_into_raw(new), new_marked);
+        let old_a = raw_to_marked(opt_shared_into_raw(old), old_mark);
+        let new_a = raw_to_marked(opt_shared_into_raw(new), new_mark);
         self.addr.compare_and_swap(old_a, new_a, ord) == old_a
     }
 
-    pub fn mark(&self, load_ord: Ordering, store_ord: Ordering) -> bool {
-        let old_a = self.addr.load(load_ord);
-        let new_a = usize_to_marked(old_a, true);
-        usize_is_marked(old_a) || 
-          self.addr.compare_and_swap(old_a, 
-                                     new_a, 
-                                     store_ord) == old_a
+    pub fn mark(&self, old: Option<Shared<T>>, old_mark: bool,
+                new_mark: bool, ord: Ordering) 
+                -> bool 
+    {
+        let old_a = raw_to_marked(opt_shared_into_raw(old), old_mark);
+        let new_a = usize_to_marked(old_a, new_mark);
+        self.addr.compare_and_swap(old_a, new_a, ord) == old_a
     }
 
-    pub fn unmark(&self, load_ord: Ordering, store_ord: Ordering) -> bool {
-        let old_a = self.addr.load(load_ord);
-        let new_a = usize_to_marked(old_a, false);
-        !usize_is_marked(old_a) || 
-          self.addr.compare_and_swap(old_a, 
-                                     new_a, 
-                                     store_ord) == old_a
-    }
-
-    pub fn swap<'a>(&self, new: Option<Owned<T>>, ord: Ordering, _: &'a Guard)
-                    -> Option<Shared<'a, T>> {
-        let new_a = raw_to_marked(opt_owned_into_raw(new), false);
+    pub fn swap<'a>(&self, new: Option<Owned<T>>, mark: bool,
+                    ord: Ordering, _: &'a Guard)
+                    -> (Option<Shared<'a, T>>, bool) 
+    {
+        let new_a = raw_to_marked(opt_owned_into_raw(new), mark);
         let old_a = self.addr.swap(new_a, ord);
-        unsafe { Shared::from_raw(marked_to_raw(old_a)) }
+        let (p, mark) = marked_to_raw(old_a);
+        unsafe { (Shared::from_raw(p), mark) }
     }
 
-    pub fn swap_shared<'a>(&self, new: Option<Shared<T>>, ord: Ordering, _: &'a Guard)
-                           -> Option<Shared<'a, T>> {
-        let new_a = raw_to_marked(opt_shared_into_raw(new), false);
+    pub fn swap_shared<'a>(&self, new: Option<Shared<T>>, mark: bool,
+                           ord: Ordering, _: &'a Guard)
+                           -> (Option<Shared<'a, T>>, bool)
+    {
+        let new_a = raw_to_marked(opt_shared_into_raw(new), mark);
         let old_a = self.addr.swap(new_a, ord);
-        unsafe { Shared::from_raw(marked_to_raw(old_a)) }
+        let (p, mark) = marked_to_raw(old_a);
+        unsafe { (Shared::from_raw(p), mark) }
     }
 }

@@ -262,4 +262,120 @@ mod test {
 
         assert_eq!(**my_atomic.load(Ordering::Relaxed, &guard).unwrap(), 42);
     }
+
+    #[test]
+    fn test_markable_no_drop() {
+        static mut DROPS: i32 = 0;
+        struct Test;
+        impl Drop for Test {
+            fn drop(&mut self) {
+                unsafe {
+                    DROPS += 1;
+                }
+            }
+        }
+        let g = pin();
+
+        let x = Atomic::null();
+        x.store(Some(Owned::new(Test)), Ordering::Relaxed);
+        x.store_and_ref(Owned::new(Test), Ordering::Relaxed, &g);
+        let y = x.load(Ordering::Relaxed, &g);
+        let z = x.cas_and_ref(y, Owned::new(Test), Ordering::Relaxed, &g).ok();
+        let _ = x.cas(z, Some(Owned::new(Test)), Ordering::Relaxed);
+        x.swap(Some(Owned::new(Test)), Ordering::Relaxed, &g);
+
+        unsafe {
+            assert_eq!(DROPS, 0);
+        }
+    }
+
+    #[test]
+    fn test_markable() {
+        let guard = epoch::pin();
+        let p = MarkableAtomic::new(42, false);
+
+        let (n, mark) = p.load(Ordering::Relaxed, &guard);
+        assert_eq!(**n.unwrap(), 42);
+        assert!(!mark);
+
+        p.store(Some(Owned::new(43)), false, Ordering::Relaxed);
+
+        let (n, mark) = p.load(Ordering::Relaxed, &guard);
+        assert_eq!(**n.unwrap(), 43);
+        assert!(!mark);
+
+        p.store(None, false, Ordering::Relaxed);
+
+        let (n, mark) = p.load(Ordering::Relaxed, &guard);
+        assert_eq!(n, None);
+        assert!(!mark);
+
+        p.store(Some(Owned::new(44)), true, Ordering::Relaxed);
+
+        let (n, mark) = p.load(Ordering::Relaxed, &guard);
+        assert_eq!(**n.unwrap(), 44);
+        assert!(mark);
+
+        let (n, _) = p.load(Ordering::Relaxed, &guard);
+        let ok = p.cas(n, Some(Owned::new(45)), 
+                       true, false, Ordering::Relaxed).is_ok();
+
+        let (n, mark) = p.load(Ordering::Relaxed, &guard);
+        assert!(ok);
+        assert_eq!(**n.unwrap(), 45);
+        assert!(!mark);
+
+        let (n, _) = p.load(Ordering::Relaxed, &guard);
+        let ok = p.cas(n, Some(Owned::new(46)), 
+                       false, true, Ordering::Relaxed).is_ok();
+
+        let (n, mark) = p.load(Ordering::Relaxed, &guard);
+        assert!(ok);
+        assert_eq!(**n.unwrap(), 46);
+        assert!(mark);
+
+        let (n, _) = p.load(Ordering::Relaxed, &guard);
+        let ok = p.cas(n, Some(Owned::new(47)), 
+                       false, true, Ordering::Relaxed).is_ok();
+
+        let (n, mark) = p.load(Ordering::Relaxed, &guard);
+        assert!(!ok);
+        assert_eq!(**n.unwrap(), 46);
+        assert!(mark);
+
+        let (old_n, _) = p.load(Ordering::Relaxed, &guard);
+        p.store(Some(Owned::new(47)), false, Ordering::Relaxed);
+        let ok = p.cas(old_n, Some(Owned::new(48)), 
+                       false, true, Ordering::Relaxed).is_ok();
+
+        let (n, mark) = p.load(Ordering::Relaxed, &guard);
+        assert!(!ok);
+        assert_eq!(**n.unwrap(), 47);
+        assert!(!mark);
+
+        let (n, _) = p.load(Ordering::Relaxed, &guard);
+        let ok = p.mark(n, false, true, Ordering::Relaxed);
+
+        let (n, mark) = p.load(Ordering::Relaxed, &guard);
+        assert!(ok);
+        assert_eq!(**n.unwrap(), 47);
+        assert!(mark);
+
+        let (n, _) = p.load(Ordering::Relaxed, &guard);
+        let ok = p.mark(n, false, true, Ordering::Relaxed);
+
+        let (n, mark) = p.load(Ordering::Relaxed, &guard);
+        assert!(!ok);
+        assert_eq!(**n.unwrap(), 47);
+        assert!(mark);
+
+        let (old_n, _) = p.load(Ordering::Relaxed, &guard);
+        p.store(Some(Owned::new(48)), false, Ordering::Relaxed);
+        let ok = p.mark(old_n, false, true, Ordering::Relaxed);
+
+        let (n, mark) = p.load(Ordering::Relaxed, &guard);
+        assert!(!ok);
+        assert_eq!(**n.unwrap(), 48);
+        assert!(!mark);
+    }
 }
