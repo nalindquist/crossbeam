@@ -238,6 +238,13 @@ impl<T> MarkableAtomic<T> {
         unsafe { (Shared::from_raw(p), mark) }
     }
 
+    pub fn load_shared<'a>(&self, ord: Ordering, guard: &'a Guard) 
+                           -> Option<Shared<'a, T>>
+    {
+        let (p, _) = self.load(ord, guard);
+        p
+    }
+
     pub fn load_mark(&self, ord: Ordering) -> bool {
         let (_, mark): (*mut T, bool) = marked_to_raw(self.addr.load(ord));
         mark
